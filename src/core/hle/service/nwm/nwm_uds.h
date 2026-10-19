@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 #include <boost/optional.hpp>
@@ -19,6 +20,7 @@
 #include "common/common_types.h"
 #include "common/swap.h"
 #include "common/threadsafe_queue.h"
+#include "core/hle/service/nwm/uds_bridge.h"
 #include "core/hle/service/nwm/uds_common.h"
 #include "core/hle/service/service.h"
 #include "network/network.h"
@@ -41,6 +43,11 @@ class DLP_SRVR;
 // Local-WLAN service
 
 namespace Service::NWM {
+
+namespace UdsReal {
+class Nl80211Monitor;
+struct CapturedFrame;
+}
 
 enum class ResultStatus {
     ResultSuccess = 0,
@@ -128,7 +135,9 @@ struct NetworkInfo {
     // This field is received as BigEndian from the game.
     u32_be wlan_comm_id;
     u8 id;
-    INSERT_PADDING_BYTES(1);
+    // Retail NWM counts the changes to a hosted network here: 1 when the network is created, plus
+    // one for every node that joins or leaves (seen as 1, 2, 3 in a retail Pokemon trade).
+    u8 update_counter;
     u16_be attributes;
     u32_be network_id;
     u8 total_nodes;
@@ -147,7 +156,7 @@ static_assert(sizeof(NetworkInfo) == 0x108, "NetworkInfo has incorrect size.");
 enum class TagId : u8 {
     SSID = 0,
     SupportedRates = 1,
-    DSParameterSet = 2,
+    DSParameterSet = 3,
     TrafficIndicationMap = 5,
     CountryInformation = 7,
     ERPInformation = 42,
@@ -245,6 +254,20 @@ private:
      *      2, 3: output buffer return descriptor & ptr
      */
     void RecvBeaconBroadcastData(Kernel::HLERequestContext& ctx);
+
+    /**
+     * NWM_UDS::SetProbeResponseParam service function.
+     * Stores the Nintendo OUI/type and the accompanying probe-response value.
+     * Azahar does not yet transmit physical probe responses, so accepting and
+     * recording these values is sufficient for the receive-only UDS Real path.
+     */
+    void SetProbeResponseParam(Kernel::HLERequestContext& ctx);
+
+    /**
+     * Undocumented command 0x23. Pokemon X calls this zero-argument command while changing PSS
+     * discovery modes. Hardware returns one u16 whose meaning is not yet documented.
+     */
+    void Unknown0x23(Kernel::HLERequestContext& ctx);
 
     /**
      * NWM_UDS::SetApplicationData service function.
@@ -519,6 +542,19 @@ private:
     Network::MacAddress GetMacAddress();
 
     void BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late);
+    /// Hands the radio a beacon for the network as it is now, without waiting for the next beacon
+    /// interval. Returns whether the radio took it.
+    bool SubmitPhysicalBeacon(const std::vector<u8>& frame);
+    void ClientKeepaliveCallback(std::uintptr_t user_data, s64 cycles_late);
+    void MonitorLingerCallback(std::uintptr_t user_data, s64 cycles_late);
+
+    // Passive sniffer (environment variable AZAHAR_UDS_SNIFF=1): follows the retail UDS sessions that
+    // this emulator is not part of, derives each network's CCMP key from its beacon, decrypts the data
+    // frames of both consoles and logs them as "UDS SNIFF ..." lines. It never transmits.
+    void StartSniffMonitor();
+    void SniffObserveBeacon(const Network::WifiPacket& beacon);
+    void SniffHandleDataFrame(const UdsReal::CapturedFrame& frame);
+    void SniffLogUnprotectedFrame(const UdsReal::CapturedFrame& frame);
 
     /**
      * Returns a list of received 802.11 beacon frames from the specified sender since the last
@@ -564,6 +600,18 @@ private:
 
     /// Callback to parse and handle a received wifi packet.
     void OnWifiPacketReceived(const Network::WifiPacket& packet);
+
+    /// Bridges an emulated WifiPacket to room multiplayer and the physical UDS radio.
+    void SendPacket(Network::WifiPacket& packet);
+
+    /// Converts a captured physical 802.11 frame into the body format used by nwm::UDS.
+    void OnPhysicalFrameReceived(UdsReal::CapturedFrame frame);
+
+    /// Wraps an emulated UDS packet in a physical 802.11 management/data MPDU and queues it.
+    void SendPhysicalPacket(const Network::WifiPacket& packet);
+
+    /// Sends the association request which a physical UDS client must issue after auth SEQ2.
+    void SendPhysicalAssociationRequest(const MacAddress& host_address);
 
     boost::optional<Network::MacAddress> GetNodeMacAddress(u16 dest_node_id, u8 flags);
 
@@ -631,6 +679,20 @@ private:
     // Event that will generate and send the 802.11 beacon frames.
     Core::TimingEventType* beacon_broadcast_event;
 
+    // Event that sends the periodic channel-3 keepalive a retail client sends to its host. The
+    // generation is bumped on every join/leave so a stale timer from an earlier session stops.
+    Core::TimingEventType* client_keepalive_event;
+    std::uintptr_t client_keepalive_generation = 0;
+
+    // The physical monitor takes ~2 s to bring up, and the game shuts UDS down and initializes it
+    // again every couple of seconds while searching. Instead of stopping the monitor on Shutdown,
+    // it lingers and is only stopped if no Initialize follows; the generation cancels that stop.
+    Core::TimingEventType* monitor_linger_event;
+    std::uintptr_t monitor_linger_generation = 0;
+
+    // Starts the passive sniffer's monitor shortly after the service is created.
+    Core::TimingEventType* sniff_start_event = nullptr;
+
     // Event for handling async event signals
     Core::TimingEventType* handle_async_event_signals_event;
 
@@ -652,6 +714,67 @@ private:
 
     // List of the last <MaxBeaconFrames> beacons received from the network.
     std::list<Network::WifiPacket> received_beacons;
+
+    // Diagnostics for the experimental physical-beacon receive path.
+    std::size_t beacon_scan_request_count{};
+    std::size_t beacon_scan_nonempty_reply_count{};
+    std::size_t beacon_decrypt_request_count{};
+    bool beacon_decrypt_valid_seen{};
+    bool have_beacon_payload_fingerprint{};
+    u32 last_beacon_application_fingerprint{};
+    std::array<u8, 0x10> last_beacon_node_md5{};
+    std::size_t begin_hosting_request_count{};
+    std::size_t beacon_broadcast_callback_count{};
+    bool have_probe_response_param{};
+    u32 probe_response_oui_type{};
+    u32 probe_response_data{};
+
+    // Physical nl80211 monitor used by the experimental UDS Real backend.
+    std::unique_ptr<UdsReal::Nl80211Monitor> real_monitor;
+
+    // Localhost UDP link to the mGBA Virtual Console wrapper (AZAHAR_UDS_BRIDGE); replaces the radio.
+    std::unique_ptr<UdsBridge> bridge;
+    std::optional<std::array<u8, 16>> physical_data_ccmp_key;
+
+    // Passive sniffer state (see StartSniffMonitor).
+    struct SniffNetwork {
+        std::array<u8, 16> key{};
+        u32 wlan_comm_id{};
+        u32 network_id{};
+        u8 id{};
+    };
+    bool sniff_enabled = false;
+    std::vector<u8> sniff_passphrase;
+    std::optional<u32> sniff_comm_id_filter;
+    std::mutex sniff_mutex;
+    std::map<Network::MacAddress, SniffNetwork> sniff_networks;
+    std::size_t sniff_frames_logged = 0;
+    std::size_t sniff_frames_without_key = 0;
+    std::size_t sniff_ccmp_failures = 0;
+    // Nintendo SecureData has its own per-sender sequence, independent of the 802.11 sequence
+    // control field and the CCMP packet number. Every host-originated SecureData packet shares
+    // this counter so a retail peer does not discard later game packets as duplicates.
+    u16 secure_data_tx_sequence_number{};
+    u64 physical_tx_packet_number{1};
+    u16 physical_tx_sequence_number{};
+    bool physical_association_request_sent{};
+    bool association_response_handled{};
+    std::size_t physical_rx_frame_count{};
+    std::size_t physical_rx_ccmp_failure_count{};
+    std::size_t connection_status_trace_count{};
+    // Last management sequence answered for each physical client. Monitor-mode capture receives
+    // every 802.11 retransmission, but a UDS management request must only be answered once.
+    std::map<u16, u16> physical_management_reply_sequences;
+    // Last EAPoL frame processed from each physical transmitter. Monitor-mode capture delivers
+    // every 802.11 retransmission as a separate frame; reprocessing an identical EAPoL-Logoff
+    // corrupts connection_status.changed_nodes (it gets XORed against the state it just set,
+    // going back to zero) even though real node changes happened.
+    std::map<Network::MacAddress, std::vector<u8>> last_eapol_frame_data;
+    // max_nodes from the beacon we actually scanned and selected via ConnectToNetwork. Real retail
+    // hardware's EAPoL-Logoff reports a different max_nodes than its own beacon does; expose the
+    // beacon's value to the game via GetConnectionStatus instead, since that's the value the game
+    // already validated when it chose this network.
+    u8 beacon_max_nodes{};
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);

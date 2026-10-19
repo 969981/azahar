@@ -398,8 +398,24 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/service/nwm/nwm_tst.h
     hle/service/nwm/nwm_uds.cpp
     hle/service/nwm/nwm_uds.h
+    hle/service/nwm/uds_real/esp32_probe.cpp
+    hle/service/nwm/uds_real/esp32_probe.h
+    hle/service/nwm/uds_real/esp32_serial.cpp
+    hle/service/nwm/uds_real/esp32_serial.h
+    hle/service/nwm/uds_real/esp32_wire.cpp
+    hle/service/nwm/uds_real/esp32_wire.h
+    hle/service/nwm/uds_real/generic_netlink.cpp
+    hle/service/nwm/uds_real/generic_netlink.h
+    hle/service/nwm/uds_real/ldnd_connection.cpp
+    hle/service/nwm/uds_real/ldnd_connection.h
+    hle/service/nwm/uds_real/ldnd_protocol.h
+    hle/service/nwm/uds_real/nl80211_monitor.cpp
+    hle/service/nwm/uds_real/nl80211_monitor.h
+    hle/service/nwm/uds_real/uds_real_config.h
     hle/service/nwm/uds_beacon.cpp
     hle/service/nwm/uds_beacon.h
+    hle/service/nwm/uds_bridge.cpp
+    hle/service/nwm/uds_bridge.h
     hle/service/nwm/uds_connection.cpp
     hle/service/nwm/uds_connection.h
     hle/service/nwm/uds_data.cpp
@@ -511,6 +527,10 @@ create_target_directory_groups(citra_core)
 
 target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core)
 target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib)
+if (WIN32)
+    # Finding the ESP32's COM port (hle/service/nwm/uds_real/esp32_serial.cpp).
+    target_link_libraries(citra_core PRIVATE setupapi)
+endif()
 target_link_libraries(citra_core PUBLIC dds-ktx PRIVATE cryptopp fmt lodepng open_source_archives)
 
 if (ENABLE_WEB_SERVICE)

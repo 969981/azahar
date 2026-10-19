@@ -95,6 +95,7 @@ enum class BooleanSetting(
     ),
     CPU_JIT(SettingKeys.use_cpu_jit(), Settings.SECTION_CORE, true),
     USE_FASTINTERP(SettingKeys.use_fastinterp(), Settings.SECTION_CORE, true),
+    USE_ESP32_UDS(SettingKeys.use_esp32_uds(), Settings.SECTION_NETWORK, false),
     HW_SHADER(SettingKeys.use_hw_shader(), Settings.SECTION_RENDERER, true),
     SHADER_JIT(SettingKeys.use_shader_jit(), Settings.SECTION_RENDERER, true),
     VSYNC(SettingKeys.use_vsync(), Settings.SECTION_RENDERER, false),
@@ -131,7 +132,8 @@ enum class BooleanSetting(
         Settings.SECTION_RENDERER,
         false
     ),
-    CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), Settings.SECTION_MISC, true);
+    // Off by default: the checker compares against official Azahar releases, not this fork.
+    CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), Settings.SECTION_MISC, false);
 
     override var boolean: Boolean = defaultValue
 

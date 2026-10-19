@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <span>
 #include <vector>
 #include "common/common_types.h"
@@ -14,6 +15,8 @@
 #include "core/hle/service/service.h"
 
 namespace Service::NWM {
+
+using DataCCMPKey = std::array<u8, 16>;
 
 enum class SAP : u8 { SNAPExtensionUsed = 0xAA };
 
@@ -42,10 +45,13 @@ static_assert(sizeof(LLCHeader) == 8, "LLCHeader has the wrong size");
  * the source and destination network node ids.
  */
 struct SecureDataHeader {
-    // TODO(Subv): It is likely that the first 4 bytes of this header are
-    // actually part of another container protocol.
+    // The first 4 bytes are a container header: the total size of everything that follows the LLC
+    // header, and the number of SecureData packets aggregated into this frame. Real hardware sends
+    // 1 for an ordinary frame (decrypted from a genuine retail trade capture) and may bundle several
+    // packets into one frame; a count of 0 makes a retail console ignore the frame entirely. Only the
+    // first packet's fields follow in this struct; later packets repeat securedata_size onward.
     u16_be protocol_size;
-    INSERT_PADDING_BYTES(2);
+    u16_be packet_count;
     u16_be securedata_size;
     u8 is_management;
     u8 data_channel;
@@ -91,8 +97,11 @@ constexpr u16 EAPoLStartMagic = 0x201;
 struct EAPoLStartPacket {
     u16_be magic = EAPoLStartMagic;
     u16_be association_id;
-    enum_le<ConnectionType> connection_type;
-    INSERT_PADDING_BYTES(3);
+    // Real hardware transmits this as a full big-endian u16 (value only ever 0-3; the parser on a
+    // retail 3DS errors out otherwise), not as a single byte. Store it as a raw integer here and
+    // convert to/from ConnectionType at the call sites.
+    u16_be connection_type;
+    INSERT_PADDING_BYTES(2);
     EAPoLNodeInfo node;
 };
 
@@ -116,11 +125,13 @@ struct EAPoLLogoffPacket {
 static_assert(sizeof(EAPoLLogoffPacket) == 0x298, "EAPoLLogoffPacket has the wrong size");
 
 /**
- * Generates an unencrypted 802.11 data payload.
+ * Generates an unencrypted 802.11 SecureData payload. Management payloads are consumed by
+ * nwm::UDS itself; ordinary payloads are delivered to the application's bound data channel.
  * @returns The generated frame payload.
  */
 std::vector<u8> GenerateDataPayload(std::span<const u8> data, u8 channel, u16 dest_node,
-                                    u16 src_node, u16 sequence_number);
+                                    u16 src_node, u16 sequence_number,
+                                    bool is_management = false);
 
 /*
  * Returns the SecureDataHeader stored in an 802.11 data frame.
@@ -171,5 +182,28 @@ std::vector<u8> GenerateEAPoLLogoffFrame(const MacAddress& mac_address, u16 netw
  * Returns a EAPoLLogoffPacket representing the specified 802.11-encapsulated data frame.
  */
 EAPoLLogoffPacket ParseEAPoLLogoffFrame(std::span<const u8> frame);
+
+/**
+ * Derives the CCMP key used by a physical UDS network. Unlike room multiplayer, a retail 3DS
+ * sends protected 802.11 data frames, so UDS Real must activate the crypto path that was already
+ * documented in this module.
+ */
+DataCCMPKey GenerateDataCCMPKey(std::span<const u8> passphrase,
+                                const NetworkInfo& network_info);
+
+/** Encrypts an 802.11 data payload and appends its eight-byte CCMP authentication tag. */
+std::vector<u8> EncryptDataFrame(std::span<const u8> payload, const DataCCMPKey& ccmp_key,
+                                 const MacAddress& sender, const MacAddress& receiver,
+                                 const MacAddress& bssid, u64 packet_number, u16 frame_control,
+                                 u16 sequence_control);
+
+/**
+ * Decrypts and authenticates an 802.11 CCMP payload. std::nullopt means that the frame failed its
+ * CCMP authentication check and must not be delivered to nwm::UDS.
+ */
+std::optional<std::vector<u8>> DecryptDataFrame(
+    std::span<const u8> encrypted_payload, const DataCCMPKey& ccmp_key, const MacAddress& sender,
+    const MacAddress& receiver, const MacAddress& bssid, u64 packet_number, u16 frame_control,
+    u16 sequence_control);
 
 } // namespace Service::NWM
