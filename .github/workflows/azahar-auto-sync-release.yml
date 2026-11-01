@@ -1,0 +1,238 @@
+name: Azahar Upstream Sync and Release
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Build the current upstream revision even if already synchronized'
+        required: false
+        type: boolean
+        default: false
+  push:
+    paths:
+      - '.github/workflows/azahar-auto-sync-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: azahar-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: \${{ steps.pull.outputs.changed }}
+      sha: \${{ steps.pull.outputs.sha }}
+    steps:
+      - name: Checkout the automation branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Fast-forward local master from official upstream
+        id: pull
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/azahar-emu/azahar.git
+          git fetch --no-tags upstream master
+          git fetch --no-tags origin master
+          current="$(git rev-parse refs/remotes/origin/master)"
+          target="$(git rev-parse refs/remotes/upstream/master)"
+          echo "sha=$target" >> "$GITHUB_OUTPUT"
+          if [[ "$current" == "$target" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already synchronized: $target"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$current" "$target"; then
+            echo "::error::Local master diverged from upstream; refusing to overwrite commits."
+            exit 1
+          fi
+          git push origin "$target:refs/heads/master"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Fast-forwarded master: $current -> $target"
+
+  linux:
+    needs: sync
+    if: \${{ needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-latest
+    container:
+      image: opensauce04/azahar-build-environment:latest
+      options: -u 1001
+    env:
+      OS: linux
+      TARGET: appimage
+      CCACHE_DIR: \${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: \${{ needs.sync.outputs.sha }}
+          submodules: recursive
+      - name: Build AppImage
+        run: ./.ci/linux.sh
+      - name: Collect AppImage
+        run: |
+          mkdir -p artifacts
+          mv build/bundle/*.AppImage artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: azahar-linux
+          path: artifacts/
+          if-no-files-found: error
+
+  windows:
+    needs: sync
+    if: \${{ needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-latest
+    container:
+      image: opensauce04/azahar-build-environment:latest
+      options: -u 1001
+    env:
+      OS: windows
+      TARGET: mxe
+      CCACHE_DIR: \${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: \${{ needs.sync.outputs.sha }}
+          submodules: recursive
+      - name: Build Windows MXE
+        run: ./.ci/win-mxe.sh
+      - name: Pack Windows build
+        run: ./.ci/pack.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: azahar-windows
+          path: artifacts/
+          if-no-files-found: error
+
+  macos:
+    needs: sync
+    if: \${{ needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: macos-26
+    env:
+      OS: macos
+      CCACHE_DIR: \${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: \${{ needs.sync.outputs.sha }}
+          submodules: recursive
+      - name: Install tools
+        run: brew install ccache ninja spirv-tools
+      - name: Install Conan
+        uses: conan-io/setup-conan@v1
+      - name: Build FFmpeg dependencies
+        run: |
+          conan install --output-folder="$HOME/conan" --generator=CMakeToolchain \
+            --build=missing -s os.version=13.4 \
+            -o "*:shared=True" -o "*:with_libfdk_aac=False" \
+            --requires=ffmpeg/7.1.5 \
+            -c "ffmpeg/*:tools.build:sharedlinkflags+=['-Wl,-flat_namespace']" \
+            -c "ffmpeg/*:tools.build:exelinkflags+=['-Wl,-flat_namespace']"
+      - name: Build ARM64
+        run: BUILD_ARCH=arm64 ./.ci/macos.sh
+      - name: Build x86_64
+        run: BUILD_ARCH=x86_64 ./.ci/macos.sh
+      - name: Create universal macOS build
+        run: ./.ci/macos-universal.sh
+      - name: Pack macOS applications
+        env:
+          PACK_INDIVIDUALLY: '1'
+        run: |
+          mkdir -p build/bundle
+          cp -R build/x86_64/bundle build/bundle/x86_64
+          cp -R build/arm64/bundle build/bundle/arm64
+          cp -R build/universal/bundle build/bundle/universal
+          ./.ci/pack.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: azahar-macos
+          path: artifacts/
+          if-no-files-found: error
+
+  android:
+    needs: sync
+    if: \${{ needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-latest
+    env:
+      OS: android
+      TARGET: vanilla
+      CCACHE_DIR: \${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: \${{ needs.sync.outputs.sha }}
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install ccache apksigner -y
+      - name: Install requested Android CMake
+        run: |
+          echo y | "\${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "cmake;3.30.3"
+      - name: Build Android Vanilla
+        run: JAVA_HOME="$JAVA_HOME_17_X64" ./.ci/android.sh
+        env:
+          ANDROID_KEYSTORE_B64: \${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEY_ALIAS: \${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASS: \${{ secrets.ANDROID_KEYSTORE_PASS }}
+      - name: Pack Android APK and AAB
+        working-directory: src/android/app
+        env:
+          UNPACKED: '1'
+        run: ../../../.ci/pack.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: azahar-android
+          path: src/android/app/artifacts/
+          if-no-files-found: error
+
+  release:
+    needs: [sync, linux, windows, macos, android]
+    if: \${{ needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build == true) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download completed platform builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: azahar-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish only after successful builds
+        env:
+          GH_TOKEN: \${{ github.token }}
+          BUILD_SHA: \${{ needs.sync.outputs.sha }}
+          GH_REPO: \${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if (( \${#assets[@]} == 0 )); then
+            echo "::error::No release assets were collected."
+            exit 1
+          fi
+          tag="upstream-\${BUILD_SHA:0:12}"
+          printf 'Upstream: https://github.com/azahar-emu/azahar\nCommit: %s\n\nAutomated Windows, Linux, macOS, and Android build. Not an official Azahar release.\n' "$BUILD_SHA" > release-notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists, leaving it unchanged."
+          else
+            gh release create "$tag" "\${assets[@]}" \
+              --target "$BUILD_SHA" \
+              --title "Azahar upstream \${BUILD_SHA:0:12}" \
+              --notes-file release-notes.md \
+              --prerelease
+          fi
