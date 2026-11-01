@@ -74,6 +74,22 @@ jobs:
         with:
           ref: ${{ needs.sync.outputs.sha }}
           submodules: recursive
+      - name: Use official PNG icon for AppImage packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Newer appimagetool requires a PNG/XPM icon to generate .DirIcon.
+          # Keep the upstream master branch untouched; patch only this CI checkout.
+          test -s dist/azahar.png
+          cmake_script=CMakeModules/BundleTarget.cmake
+          grep -Fq '/dist/azahar.svg' "$cmake_script"
+          grep -Fq '/dist/org.azahar_emu.Azahar.svg' "$cmake_script"
+          sed -i \
+            -e 's@/dist/azahar.svg@/dist/azahar.png@g' \
+            -e 's@/dist/org.azahar_emu.Azahar.svg@/dist/org.azahar_emu.Azahar.png@g' \
+            "$cmake_script"
+          grep -Fq '/dist/azahar.png' "$cmake_script"
+          grep -Fq '/dist/org.azahar_emu.Azahar.png' "$cmake_script"
       - name: Build AppImage
         run: ./.ci/linux.sh
       - name: Collect AppImage
