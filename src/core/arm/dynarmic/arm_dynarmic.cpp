@@ -4,6 +4,9 @@
 
 #include <cstring>
 #include <dynarmic/interface/A32/a32.h>
+#include "dynarmic/frontend/A32/a32_ir_emitter.h"
+#include "dynarmic/frontend/A32/a32_types.h"
+#include "core/arm/dynarmic/experimental_rng/mt_jit_trace_bridge.h"
 #include <dynarmic/interface/optimization_flags.h>
 #include "common/assert.h"
 #include "common/microprofile.h"
@@ -22,7 +25,7 @@ namespace Core {
 class DynarmicUserCallbacks final : public Dynarmic::A32::UserCallbacks {
 public:
     explicit DynarmicUserCallbacks(ARM_Dynarmic& parent)
-        : parent(parent), svc_context(parent.system), memory(parent.memory) {}
+        : parent(parent), svc_context(parent.system), memory(parent.memory), rng_trace(parent.GetID()) {}
     ~DynarmicUserCallbacks() = default;
 
     std::uint8_t MemoryRead8(VAddr vaddr) override {
@@ -62,6 +65,43 @@ public:
     }
     bool MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) override {
         return memory.WriteExclusive64(vaddr, value, expected);
+    }
+
+
+    // Optional, read-only JIT execution instrumentation. Unlike GDB breakpoints
+    // this emits two host calls in generated native code without halting the CPU.
+    // Disabled unless the operator explicitly opts in to X 1.5 research mode.
+    static void RngEntryThunk(u64 self, u64 object, u64 lr) {
+        auto& cb=*reinterpret_cast<DynarmicUserCallbacks*>(static_cast<std::uintptr_t>(self));
+        if (object == Core::NativeMtTrace::kObject && cb.rng_trace.Verified()) {
+            cb.rng_trace.Entry(static_cast<u32>(object),static_cast<u32>(lr),
+                               cb.memory.Read32(Core::NativeMtTrace::kObject));
+        }
+    }
+    static void RngReturnThunk(u64 self, u64 result, u64 lr) {
+        auto& cb=*reinterpret_cast<DynarmicUserCallbacks*>(static_cast<std::uintptr_t>(self));
+        if (cb.rng_trace.Verified()) {
+            cb.rng_trace.Return(static_cast<u32>(result),static_cast<u32>(lr),
+                                cb.memory.Read32(Core::NativeMtTrace::kObject));
+        }
+    }
+
+    void PreCodeTranslationHook(bool is_thumb, VAddr pc,
+                                Dynarmic::A32::IREmitter& ir) override {
+        if (is_thumb || !rng_trace.Requested() ||
+            (pc != Core::NativeMtTrace::kBody && pc != Core::NativeMtTrace::kReturn))
+            return;
+        if (!rng_trace.Verified() &&
+            !rng_trace.Verify([this](u32 a){return memory.Read32(a);}))
+            return;
+        const auto self=Dynarmic::IR::U64{
+            Dynarmic::IR::Value{static_cast<u64>(reinterpret_cast<std::uintptr_t>(this))}};
+        const auto r0=ir.ZeroExtendWordToLong(ir.GetRegister(Dynarmic::A32::Reg::R0));
+        const auto lr=ir.ZeroExtendWordToLong(ir.GetRegister(Dynarmic::A32::Reg::LR));
+        if (pc == Core::NativeMtTrace::kBody)
+            ir.CallHostFunction(&DynarmicUserCallbacks::RngEntryThunk,self,r0,lr);
+        else
+            ir.CallHostFunction(&DynarmicUserCallbacks::RngReturnThunk,self,r0,lr);
     }
 
     void InterpreterFallback(VAddr pc, std::size_t num_instructions) override {
@@ -120,6 +160,7 @@ public:
     ARM_Dynarmic& parent;
     Kernel::SVCContext svc_context;
     Memory::MemorySystem& memory;
+    Core::NativeMtTrace::Bridge rng_trace;
 };
 
 ARM_Dynarmic::ARM_Dynarmic(Core::System& system_, Memory::MemorySystem& memory_, u32 core_id_,
@@ -140,6 +181,7 @@ void ARM_Dynarmic::Run() {
     MICROPROFILE_SCOPE(ARM_Jit);
 
     jit->Run();
+    cb->rng_trace.Drain(); // outside the JIT host callback; never I/O on RNG calls
 }
 
 void ARM_Dynarmic::Step() {
@@ -276,6 +318,7 @@ std::shared_ptr<Memory::PageTable> ARM_Dynarmic::GetPageTable() const {
 
 void ARM_Dynarmic::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
     current_page_table = page_table;
+    cb->rng_trace.MappingChanged();
     ThreadContext ctx{};
     if (jit) {
         SaveContext(ctx);
