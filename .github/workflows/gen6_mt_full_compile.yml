@@ -1,0 +1,28 @@
+name: Gen6 MT Dynarmic integration build (experimental)
+on:
+  push:
+    paths:
+      - 'src/core/arm/dynarmic/**'
+      - '.github/workflows/gen6_mt_full_compile.yml'
+  pull_request:
+    paths:
+      - 'src/core/arm/dynarmic/**'
+      - '.github/workflows/gen6_mt_full_compile.yml'
+jobs:
+  linux-compile:
+    runs-on: ubuntu-latest
+    container:
+      image: opensauce04/azahar-build-environment:latest
+      options: -u 1001
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      OS: linux
+      TARGET: fresh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Compile complete Azahar and test (no proprietary ROM)
+        run: ./.ci/linux.sh
