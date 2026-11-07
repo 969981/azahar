@@ -1,0 +1,34 @@
+name: Gen6 MT JIT observer (host unit tests)
+on:
+  push:
+    paths:
+      - 'src/core/arm/dynarmic/experimental_rng/**'
+      - 'src/core/arm/dynarmic/arm_dynarmic.cpp'
+      - 'tests/rng_trace_bridge_test.cpp'
+      - '.github/workflows/gen6_mt_jit_trace.yml'
+  pull_request:
+    paths:
+      - 'src/core/arm/dynarmic/experimental_rng/**'
+      - 'src/core/arm/dynarmic/arm_dynarmic.cpp'
+      - 'tests/rng_trace_bridge_test.cpp'
+      - '.github/workflows/gen6_mt_jit_trace.yml'
+jobs:
+  event-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build observer-only test (not full emulator)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -O2 -pthread -Isrc             tests/rng_trace_bridge_test.cpp -o /tmp/rng_bridge_test
+          /tmp/rng_bridge_test /tmp/rng_ci
+      - name: Confirm code integration source has both JIT injection points
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/core/arm/dynarmic/arm_dynarmic.cpp').read_text()
+          for symbol in ('PreCodeTranslationHook','RngEntryThunk','RngReturnThunk',
+                         'ir.CallHostFunction','rng_trace.MappingChanged()',
+                         'cb->rng_trace.Drain()'):
+              assert symbol in p, symbol
+          print('Integration symbols present (not an emulator runtime test)')
+          PY
