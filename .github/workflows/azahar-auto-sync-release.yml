@@ -27,12 +27,15 @@ jobs:
     outputs:
       changed: ${{ steps.pull.outputs.changed }}
       sha: ${{ steps.pull.outputs.sha }}
+      upstream_sha: ${{ steps.pull.outputs.upstream_sha }}
     steps:
-      - name: Checkout the automation branch
+      - name: Checkout the automation branch with full history
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-      - name: Fast-forward local master from official upstream
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Sync upstream source without modifying fork workflow files
         id: pull
         shell: bash
         run: |
@@ -40,21 +43,47 @@ jobs:
           git remote add upstream https://github.com/azahar-emu/azahar.git
           git fetch --no-tags upstream master
           git fetch --no-tags origin master
-          current="$(git rev-parse refs/remotes/origin/master)"
+          git checkout -B master refs/remotes/origin/master
+          current="$(git rev-parse HEAD)"
           target="$(git rev-parse refs/remotes/upstream/master)"
-          echo "sha=$target" >> "$GITHUB_OUTPUT"
-          if [[ "$current" == "$target" ]]; then
+          echo "upstream_sha=$target" >> "$GITHUB_OUTPUT"
+          state=.github/azahar-upstream.sha
+          if [ -f "$state" ]; then
+            previous=$(cat "$state")
+          else
+            previous=$(git merge-base "$current" "$target")
+          fi
+          test -n "$previous" && git cat-file -e "$previous^{commit}"
+          if [ "$previous" = "$target" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Already synchronized: $target"
+            echo "sha=$current" >> "$GITHUB_OUTPUT"
+            echo "Already synchronized source: $target"
             exit 0
           fi
-          if ! git merge-base --is-ancestor "$current" "$target"; then
-            echo "::error::Local master diverged from upstream; refusing to overwrite commits."
+          if ! git merge-base --is-ancestor "$previous" "$target"; then
+            echo '::error::Upstream history was rewritten; refusing an unsafe sync.'
             exit 1
           fi
-          git push origin "$target:refs/heads/master"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          patch="$RUNNER_TEMP/azahar-upstream.patch"
+          # A GITHUB_TOKEN cannot push changes to .github/workflows; keep the fork's reviewed workflows.
+          git diff --binary "$previous" "$target" -- . ':(exclude).github/workflows/**' > "$patch"
+          if [ -s "$patch" ]; then
+            git apply --3way --index "$patch"
+          fi
+          printf '%s\n' "$target" > "$state"
+          git add "$state"
+          if git diff --cached --name-only | grep -q '^.github/workflows/'; then
+            echo '::error::Refusing to modify fork workflow files.'
+            exit 1
+          fi
+          git commit -m "chore(sync): upstream source $target"
+          git push origin HEAD:master
+          mirrored=$(git rev-parse HEAD)
+          echo "sha=$mirrored" >> "$GITHUB_OUTPUT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "Fast-forwarded master: $current -> $target"
+          echo "Synchronized upstream $target into fork commit $mirrored without workflow writes."
 
   linux:
     needs: sync
@@ -231,6 +260,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BUILD_SHA: ${{ needs.sync.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
@@ -241,14 +271,14 @@ jobs:
             echo "::error::No release assets were collected."
             exit 1
           fi
-          tag="upstream-${BUILD_SHA:0:12}"
-          printf 'Upstream: https://github.com/azahar-emu/azahar\nCommit: %s\n\nAutomated Windows, Linux, macOS, and Android build. Not an official Azahar release.\n' "$BUILD_SHA" > release-notes.md
+          tag="upstream-${UPSTREAM_SHA:0:12}"
+          printf 'Upstream: https://github.com/azahar-emu/azahar\nUpstream commit: %s\nFork build commit: %s\n\nAutomated Windows, Linux, macOS, and Android build. Not an official Azahar release.\n' "$UPSTREAM_SHA" "$BUILD_SHA" > release-notes.md
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists, leaving it unchanged."
           else
             gh release create "$tag" "${assets[@]}" \
               --target "$BUILD_SHA" \
-              --title "Azahar upstream ${BUILD_SHA:0:12}" \
+              --title "Azahar upstream ${UPSTREAM_SHA:0:12}" \
               --notes-file release-notes.md \
               --prerelease
           fi
